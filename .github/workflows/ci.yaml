@@ -1,0 +1,38 @@
+name: CI - Flask App
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Authenticate to GCP (Workload Identity)
+      uses: google-github-actions/auth@v2
+      with:
+        workload_identity_provider: projects/${{ secrets.GCP_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/github-pool/providers/github-provider
+        service_account: github-ci-sa@my-project-95-480908.iam.gserviceaccount.com
+
+    - name: Set up gcloud
+      uses: google-github-actions/setup-gcloud@v2
+
+    - name: Basic Python validation
+      run: |
+        python -m compileall app/
+
+    - name: Build & Push Image with Cloud Build
+      run: |
+        gcloud builds submit \
+          --tag us-central1-docker.pkg.dev/my-project-95-480908/flask-backend-repo/flask-app:${{ github.sha }}
+
