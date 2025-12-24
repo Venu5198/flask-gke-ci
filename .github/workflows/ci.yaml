@@ -1,39 +1,197 @@
-name: CI - Flask App
+name: FlaskCI-CDPipeline
 
 on:
-  pull_request:
   push:
     branches:
       - main
 
-permissions:
-  contents: read
-  id-token: write
-
+# ==================================================
+# JOB 1: CHECKOUT + PYTHON SETUP + DEPENDENCIES
+# ==================================================
 jobs:
-  build:
+  setup:
+    name: Checkout and Setup
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout source code
+        uses: actions/checkout@v4
 
-    - name: Authenticate to GCP (Workload Identity)
-      uses: google-github-actions/auth@v2
-      with:
-        workload_identity_provider: projects/${{ secrets.GCP_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/github-pool/providers/github-provider
-        service_account: github-ci-sa@my-project-95-480908.iam.gserviceaccount.com
-        audience: https://iam.googleapis.com/projects/${{ secrets.GCP_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/github-pool/providers/github-provider
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
 
-    - name: Set up gcloud
-      uses: google-github-actions/setup-gcloud@v2
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-    - name: Basic Python validation
-      run: |
-        python -m compileall app/
+# ==================================================
+# JOB 2: STATIC CODE ANALYSIS (BANDIT)
+# ==================================================
+  static-analysis:
+    name: Static Code Analysis (Bandit)
+    runs-on: ubuntu-latest
+    needs: setup
 
-    - name: Build & Push Image with Cloud Build
-      run: |
-        gcloud builds submit \
-          --tag us-central1-docker.pkg.dev/my-project-95-480908/flask-backend-repo/flask-app:${{ github.sha }}
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
 
+      - name: Install Bandit
+        run: |
+          pip install bandit
+
+      - name: Run Bandit scan
+        run: |
+          bandit -r app
+
+# ==================================================
+# JOB 3: UNIT TESTS + COVERAGE
+# ==================================================
+  unit-tests:
+    name: Unit Tests and Coverage
+    runs-on: ubuntu-latest
+    needs: static-analysis
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest pytest-cov
+
+      - name: Run Pytest with coverage
+        run: |
+          pytest --cov=app
+
+# ==================================================
+# JOB 4: DOCKER BUILD
+# ==================================================
+  docker-build:
+    name: Docker Build
+    runs-on: ubuntu-latest
+    needs: unit-tests
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: |
+          docker build -t flask-app:ci .
+
+# ==================================================
+# JOB 5: TRIVY IMAGE SCAN
+# ==================================================
+  trivy-scan:
+    name: Trivy Image Scan
+    runs-on: ubuntu-latest
+    needs: docker-build
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Build image for scan
+        run: |
+          docker build -t flask-app:scan .
+
+      - name: Run Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: flask-app:scan
+          exit-code: 1
+          severity: HIGH,CRITICAL
+
+# ==================================================
+# JOB 6: PUSH IMAGE TO ARTIFACT REGISTRY (CI OUTPUT)
+# ==================================================
+  push-to-gar:
+    name: Push Image to Artifact Registry
+    runs-on: ubuntu-latest
+    needs: trivy-scan
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to GCP using OIDC (WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/${{ secrets.GCP_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/github-pool/providers/github-provider
+          service_account: github-ci-sa@my-project-95-480908.iam.gserviceaccount.com
+          audience: https://iam.googleapis.com/projects/${{ secrets.GCP_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/github-pool/providers/github-provider
+
+      - name: Setup gcloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: |
+          gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+
+      - name: Build Docker image with commit SHA
+        run: |
+          docker build \
+            -t us-central1-docker.pkg.dev/my-project-95-480908/flask-backend-repo/flask-app:${{ github.sha }} .
+
+      - name: Push Docker image
+        run: |
+          docker push \
+            us-central1-docker.pkg.dev/my-project-95-480908/flask-backend-repo/flask-app:${{ github.sha }}
+
+# ==================================================
+# JOB 7: DEPLOY TO GKE (CD)
+# ==================================================
+  deploy-to-gke:
+    name: Deploy to GKE
+    runs-on: ubuntu-latest
+    needs: push-to-gar
+
+    permissions:
+      id-token: write
+      contents: read
+
+    env:
+      USE_GKE_GCLOUD_AUTH_PLUGIN: "True"
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to GCP using OIDC (WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/${{ secrets.GCP_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/github-pool/providers/github-provider
+          service_account: github-ci-sa@my-project-95-480908.iam.gserviceaccount.com
+          audience: https://iam.googleapis.com/projects/${{ secrets.GCP_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/github-pool/providers/github-provider
+
+      - name: Setup gcloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Install GKE auth plugin
+        run: |
+          gcloud components install gke-gcloud-auth-plugin --quiet
+
+      - name: Get GKE cluster credentials
+        run: |
+          gcloud container clusters get-credentials flask-gke-cluster \
+            --zone us-central1-a \
+            --project my-project-95-480908
+
+      - name: Deploy new image to Kubernetes
+        run: |
+          kubectl set image deployment/flask-app \
+            flask-app=us-central1-docker.pkg.dev/my-project-95-480908/flask-backend-repo/flask-app:${{ github.sha }} \
+            -n dev
+
+      - name: Wait for rollout to complete
+        run: |
+          kubectl rollout status deployment/flask-app -n dev
